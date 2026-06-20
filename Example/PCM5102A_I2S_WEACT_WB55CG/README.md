@@ -40,7 +40,6 @@ The project generates a continuous sine wave in software and transmits it to the
 | PA8  | SAI1_SCK_A (BCLK) | BCK |
 | PB9  | SAI1_FS_A (LRCK / WS) | LCK |
 | PA10 | SAI1_SD_A (DATA) | DIN |
-| MCLK | SAI1_MCLK_A | SCK (MCLK) |
 | 3.3V | Power | VCC |
 | GND | Ground | GND |
 
@@ -49,8 +48,7 @@ The project generates a continuous sine wave in software and transmits it to the
 > - **PA8** → Bit Clock (BCLK)
 > - **PB9** → Left/Right Clock (LRCK / Word Select)
 > - **PA10** → Serial Audio Data (SD)
-> - **MCLK** must also be connected to the PCM5102A **SCK** input when the module is configured for an external master clock. :contentReference[oaicite:0]{index=0}
-
+> - **MCLK** → jumper to GND (driven by internal PCM510a)
 
 ---
 
@@ -70,6 +68,7 @@ This configuration enables:
 - I2S format
 - External Master Clock (MCLK)
 - Normal operation
+- Also need to jumper MCLK to GND
 
 ---
 
