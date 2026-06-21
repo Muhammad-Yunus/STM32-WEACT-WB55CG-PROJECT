@@ -10,7 +10,7 @@ input dan output berjalan melalui koneksi USB ke PC.
 | ------------------- | ------------------------------------------ |
 | MCU                 | STM32WB55CGU6 (ARM Cortex-M4 @ 64 MHz)     |
 | Board               | WEACT Studio STM32WB55CGU6                 |
-| USB                 | FS USB (Full-Speed, 12 Mbps)              |
+| USB                 | FS USB (Full-Speed, 12 Mbps)               |
 | Debugger/Programmer | ST-Link/V2-1 (built-in on WEACT board)     |
 | Crystal             | HSE 8 MHz + HSI48 for USB FS clock         |
 
@@ -20,24 +20,24 @@ input dan output berjalan melalui koneksi USB ke PC.
 ┌───────────────────────────────────────────────────┐
 │ PC — Terminal (PuTTY / Screen / Arduino Serial)   │
 │   "hello\r\n"  ──USB──►                           │
-└───────────��───────────────────────────────────────┘
+└───────────────────────────────────────────────────┘
                         ▲
                         │ USB CDC (Virtual COM)
                         ▼
 ┌───────────────────────────────────────────────────┐
-│ WEACT STM32WB55CGU6                                │
+│ WEACT STM32WB55CGU6                               │
 │                                                   │
-│  USB Device Stack (STM32 CubeMX / HAL)             │
-│  ┌───────────────────┐                             │
+│  USB Device Stack (STM32 CubeMX / HAL)            │
+│  ┌───────────────────┐                            │
 │  │ usbd_cdc_if.c     │  ← CDC_Receive_FS()        │
 │  │   CDC_ProcessPacket()  push into ring buffer   │
-│  └────────┬──────────┘                             │
-│           │                                        │
+│  └────────┬──────────┘                            │
+│           │                                       │
 │  ┌────────▼──────────┐                            │
-│  │ cdc_uart.c        │  ← ring-buffer + ReadLine │
+│  │ cdc_uart.c        │  ← ring-buffer + ReadLine  │
 │  │                   │     + Printf + TX blocking │
 │  └────────┬──────────┘                            │
-│           │                                        ��
+│           │                                       │ 
 │  ┌────────▼──────────┐                            │
 │  │ main.c            │  ← while(1) ReadLine/Printf│
 │  │   "Echo> hello"   │                            │
