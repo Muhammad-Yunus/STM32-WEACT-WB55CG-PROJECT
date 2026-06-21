@@ -185,5 +185,5 @@ Custom additions (`cdc_uart.c`, `cdc_uart.h`, `main.c` USER CODE) are MIT licens
 
 ## Board Reference
 
-- [WEACT Studio STM32WB55CGU6](https://github.com/WeActStudio/WeActStudio.STM32WB55CG_Core_Module)
+- [WEACT Studio STM32WB55CGU6](https://github.com/WeActStudio/WeActStudio.STM32WB55CoreBoard)
 - STM32WB55 Reference Manual: RM0481
