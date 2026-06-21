@@ -1,0 +1,395 @@
+/*
+ * sd_spi.c
+ *
+ *  Created on: Jun 20, 2026
+ *      Author: Asus
+ */
+
+#include "sd_spi.h"
+#include <string.h>
+#include <stdio.h>
+#include "logger.h"
+
+// ===== USER CONFIG =====
+extern SPI_HandleTypeDef hspi1;
+
+#define SD_CS_LOW()   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET)
+#define SD_CS_HIGH()  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET)
+
+// ===== SD COMMANDS =====
+#define CMD0  (0x40+0)
+#define CMD8  (0x40+8)
+#define CMD9  (0x40+9)
+#define CMD17 (0x40+17)
+#define CMD24 (0x40+24)
+#define CMD55 (0x40+55)
+#define CMD41 (0x40+41)
+#define CMD58 (0x40+58)
+
+// ===== CARD TYPE =====
+static uint8_t isSDHC = 0;
+static uint32_t sd_sector_count = 0;
+
+// ===== LOW LEVEL SPI =====
+static uint8_t SPI_Xfer(uint8_t data)
+{
+    uint8_t rx;
+    HAL_SPI_TransmitReceive(&hspi1, &data, &rx, 1, HAL_MAX_DELAY);
+    return rx;
+}
+
+static void SPI_ClockDummy(uint32_t n)
+{
+    for (uint32_t i = 0; i < n; i++)
+        SPI_Xfer(0xFF);
+}
+
+// ===== SEND CMD =====
+static uint8_t SD_SendCmd(uint8_t cmd, uint32_t arg, uint8_t crc)
+{
+    uint8_t res;
+    uint8_t packet[6];
+
+    SPI_Xfer(0xFF);
+
+    packet[0] = cmd;
+    packet[1] = (arg >> 24) & 0xFF;
+    packet[2] = (arg >> 16) & 0xFF;
+    packet[3] = (arg >> 8) & 0xFF;
+    packet[4] = (arg) & 0xFF;
+    packet[5] = crc;
+
+    for (int i = 0; i < 6; i++)
+        SPI_Xfer(packet[i]);
+
+    for (int i = 0; i < 10; i++)
+    {
+        res = SPI_Xfer(0xFF);
+        if (!(res & 0x80))
+            break;
+    }
+
+    return res;
+}
+
+// ==== SECTOR COUNT ====
+static uint32_t SD_CalcSectorCount(uint8_t *csd)
+{
+  uint32_t c_size;
+  uint32_t c_size_mult;
+  uint32_t read_bl_len;
+  uint32_t blocknr;
+
+  if ((csd[0] >> 6) == 1) // CSD version 2.0 (SDHC/SDXC)
+  {
+    c_size = ((csd[7] & 0x3F) << 16) |
+             (csd[8] << 8) |
+             csd[9];
+
+    LOG_I("[SD] CSD v2.0: c_size=%lu -> sectors=%lu\r\n", c_size, (uint32_t)(c_size + 1) * 1024);
+    return (c_size + 1) * 1024; // sectors are 512B
+  }
+  else if ((csd[0] >> 6) == 2) // CSD version 1.0 (SDSC)
+  {
+    c_size = ((csd[6] & 0x03) << 10) |
+             (csd[7] << 2) |
+             ((csd[8] & 0xC0) >> 6);
+
+    c_size_mult = ((csd[9] & 0x03) << 1) |
+                  ((csd[10] & 0x80) >> 7);
+
+    read_bl_len = csd[5] & 0x0F;
+
+    blocknr = (c_size + 1) *
+              (1 << (c_size_mult + 2));
+
+    LOG_I("[SD] CSD v1.0: c_size=%lu c_size_mult=%lu read_bl_len=%lu -> blocknr=%lu -> sectors=%lu\r\n",
+          c_size, c_size_mult, read_bl_len, blocknr,
+          (blocknr * (1 << read_bl_len)) / 512);
+    return (blocknr * (1 << read_bl_len)) / 512;
+  }
+  else
+  {
+    LOG_I("[SD] Unknown CSD version 0x%x!\r\n", csd[0] >> 6);
+    return 0;
+  }
+}
+
+uint32_t SD_GetSectorCount(void)
+{
+  return sd_sector_count;
+}
+
+// ===== INIT SD =====
+SD_Result SD_Init(void)
+{
+    uint8_t csd[16];   // 🔥 INI YANG HILANG DI CODE KAMU
+
+    SD_CS_HIGH();
+    SPI_ClockDummy(10);
+
+    SD_CS_LOW();
+
+    // CMD0: reset
+    if (SD_SendCmd(CMD0, 0, 0x95) != 0x01)
+    {
+        SD_CS_HIGH();
+        return SD_ERROR;
+    }
+
+    // CMD8: check voltage + detect SD v2.0+
+    uint8_t r7[4];
+    uint8_t cmd8_ok = 0;
+    uint8_t res = 0xFF;
+
+    // Retrain CMD8 if it initially fails
+    for (int cmd8_retry = 0; cmd8_retry < 5; cmd8_retry++)
+    {
+        res = SD_SendCmd(CMD8, 0x1AA, 0x87);
+        if (res == 0x01)
+        {
+            for (int i = 0; i < 4; i++)
+                r7[i] = SPI_Xfer(0xFF);
+
+            if (r7[2] == 0x01 && r7[3] == 0xAA)
+            {
+                isSDHC = 1;
+                cmd8_ok = 1;
+                break;
+            }
+        }
+        for (volatile int d = 0; d < 100000; d++);  /* delay between CMD8 retries */
+    }
+
+    /* ACMD41 init loop — per versi 26b19d4 (SD card detect sukses) */
+    uint32_t timeout = 100000;
+    do {
+        SD_SendCmd(CMD55, 0, 0x65);
+        res = SD_SendCmd(CMD41, 0x40000000, 0x77);
+        timeout--;
+    } while (res != 0x00 && timeout);
+
+    if (!timeout)
+    {
+        SD_CS_HIGH();
+        LOG_I("[SD] ACMD41 FAILED!\r\n");
+        return SD_ERROR;
+    }
+    LOG_I("[SD] ACMD41 OK\r\n");
+
+    // CMD9: READ CSD
+    SD_SendCmd(CMD9, 0, 0xFF);
+
+    // Wait for data token (0xFE)
+    uint32_t tmo = 100000;
+    do {
+        csd[0] = SPI_Xfer(0xFF);
+    } while (csd[0] == 0xFF && --tmo);
+
+    if (csd[0] != 0xFE)
+    {
+        SD_CS_HIGH();
+        return SD_ERROR;
+    }
+
+    // Read remaining 15 bytes of CSD + discard leftover
+    for (int i = 1; i < 16; i++)
+        csd[i] = SPI_Xfer(0xFF);
+
+    // Discard 2 CRC bytes
+    SPI_Xfer(0xFF);
+    SPI_Xfer(0xFF);
+
+    SD_CS_HIGH();
+    SPI_Xfer(0xFF);
+
+    sd_sector_count = SD_CalcSectorCount(csd);
+
+    LOG_I("[SD] CMD8 OK=%d isSDHC=%d sector_count=%lu\r\n",
+          cmd8_ok, isSDHC, sd_sector_count);
+
+    // Hex dump CSD for debugging
+    char csd_hex[33];
+    for(int i = 0; i < 16; i++) {
+        sprintf(csd_hex + i*2, "%02X", csd[i]);
+    }
+    LOG_I("[SD] CSD hex: %s\r\n", csd_hex);
+
+    return SD_OK;
+}
+
+// ===== READ SECTOR =====
+uint8_t SD_ReadSector(uint32_t sector, uint8_t *buff)
+{
+    uint8_t token;
+
+    if (!isSDHC)
+        sector *= 512;
+
+    SD_CS_LOW();
+
+    if (SD_SendCmd(CMD17, sector, 0xFF) != 0x00)
+    {
+        SD_CS_HIGH();
+        return 1;
+    }
+
+    // wait data token
+    uint32_t timeout = 100000;
+    do {
+        token = SPI_Xfer(0xFF);
+    } while (token == 0xFF && --timeout);
+
+    if (token != 0xFE)
+    {
+        SD_CS_HIGH();
+        return 1;
+    }
+
+    for (int i = 0; i < 512; i++)
+        buff[i] = SPI_Xfer(0xFF);
+
+    SPI_Xfer(0xFF); // CRC
+    SPI_Xfer(0xFF);
+
+    SD_CS_HIGH();
+    SPI_Xfer(0xFF);
+
+    return 0;
+}
+
+// ===== WRITE SECTOR =====
+uint8_t SD_WriteSector(uint32_t sector, const uint8_t *buff)
+{
+    uint8_t resp;
+
+    if (!isSDHC)
+        sector *= 512;
+
+    SD_CS_LOW();
+
+    if (SD_SendCmd(CMD24, sector, 0xFF) != 0x00)
+    {
+        SD_CS_HIGH();
+        return 1;
+    }
+
+    SPI_Xfer(0xFF);
+    SPI_Xfer(0xFE); // data token
+
+    for (int i = 0; i < 512; i++)
+        SPI_Xfer(buff[i]);
+
+    SPI_Xfer(0xFF); // CRC
+    SPI_Xfer(0xFF);
+
+    resp = SPI_Xfer(0xFF);
+    if ((resp & 0x1F) != 0x05)
+    {
+        SD_CS_HIGH();
+        return 1;
+    }
+
+    while (SPI_Xfer(0xFF) == 0x00);
+
+    SD_CS_HIGH();
+    SPI_Xfer(0xFF);
+
+    return 0;
+}
+
+/**
+ * Write a minimal valid FAT32 boot sector.
+ * This is all Windows needs to recognize the card as FAT32.
+ * Windows will format the card on first connect (writes FAT tables + root dir).
+ *
+ * Layout (sectors):
+ *   0:       Boot sector (MBR + FAT32 BPB)
+ *   1-31:    Reserved (blank)
+ *   32+:     Data area (FAT tables + clusters written by Windows on format)
+ */
+void SD_WipeBootSectors(void)
+{
+    static uint8_t buf[512];
+    memset(buf, 0, 512);
+
+    uint32_t total_sectors = SD_GetSectorCount();
+
+    // === BPB (BIOS Parameter Block) ===
+    // 0x00-0x02: Jump instruction
+    buf[0] = 0xEB; buf[1] = 0x58; buf[2] = 0x90;
+    // 0x03-0x0A: OEM name
+    memcpy(&buf[3], "MSWIN4.1", 8);
+    // 0x0B-0x0C: Bytes per sector = 512
+    buf[11] = 0x00;   // Low byte
+    buf[12] = 0x02;   // High byte (512 = 0x0200)
+    // 0x0D: Sectors per cluster = 8 (4KB)
+    buf[13] = 8;
+    // 0x0E-0x0F: Reserved sectors = 32 (sector 0 = boot, 1-31 = reserved)
+    buf[14] = 32; buf[15] = 0;
+    // 0x10: FAT count = 2
+    buf[16] = 2;
+    // 0x11-0x12: Root entry count = 0 (FAT32)
+    buf[17] = 0; buf[18] = 0;
+    // 0x13-0x14: Total sectors (16-bit) = 0 (use 32-bit for FAT32)
+    buf[19] = 0; buf[20] = 0;
+    // 0x15: Media descriptor = 0xF0
+    buf[21] = 0xF0;
+    // 0x16-0x17: Sectors per FAT (16-bit) = 0 (FAT32 uses 32-bit)
+    buf[22] = 0; buf[23] = 0;
+    // 0x18-0x19: Sectors per track
+    buf[24] = 0; buf[25] = 0;
+    // 0x1A-0x1B: Number of heads
+    buf[26] = 0; buf[27] = 0;
+    // 0x1C-0x1F: Hidden sectors (LBA start) = 0
+    // (already zero from memset)
+    // 0x20-0x23: Total sectors (32-bit)
+    buf[0x20] = total_sectors & 0xFF;
+    buf[0x21] = (total_sectors >> 8) & 0xFF;
+    buf[0x22] = (total_sectors >> 16) & 0xFF;
+    buf[0x23] = (total_sectors >> 24) & 0xFF;
+
+    // === FAT32-specific fields (Extended BPB) ===
+    // 0x24-0x25: Sectors per FAT (32-bit) = 0 (placeholder — Windows fills on format)
+    // 0x26-0x27: Extended BPB version
+    // 0x28-0x2B: Root cluster = 2
+    buf[0x28] = 2; buf[0x29] = 0; buf[0x2A] = 0; buf[0x2B] = 0;
+    // 0x2C-0x2D: FSInfo sector = 1
+    buf[0x2C] = 1; buf[0x2D] = 0;
+    // 0x2E-0x2F: Backup boot sector = 6
+    buf[0x2E] = 6; buf[0x2F] = 0;
+    // 0x30-0x3B: Reserved
+    // 0x3C-0x3D: Drive number = 0x80
+    buf[0x3C] = 0x80;
+    // 0x3E-0x40: Reserved
+    // 0x41: Extended boot signature = 0x29
+    buf[0x41] = 0x29;
+    // 0x42-0x45: Volume serial number
+    buf[0x42] = 0xAB; buf[0x43] = 0xCD; buf[0x44] = 0xEF; buf[0x45] = 0x01;
+    // 0x46-0x52: Volume label (11 bytes, padded with spaces)
+    memcpy(&buf[0x46], "STMFAT32 ", 10);
+    // 0x53-0x5A: Filesystem type (8 bytes)
+    memcpy(&buf[0x53], "FAT32   ", 8);
+
+    // 0x1FE-0x1FF: Boot signature = 0x55AA
+    buf[510] = 0x55;
+    buf[511] = 0xAA;
+
+    // Write boot sector to sector 0 (LBA)
+    if (SD_WriteSector(0, buf) != 0)
+    {
+        LOG_I("[FS] ERROR: Failed to write boot sector\r\n");
+        return;
+    }
+
+    // Write backup boot sector to sector 6 (LBA)
+    if (SD_WriteSector(6, buf) != 0)
+    {
+        LOG_I("[FS] ERROR: Failed to write backup boot sector\r\n");
+    }
+
+    LOG_I("[FS] FAT32 boot sector written (sector 0, backup at 6)\r\n");
+    LOG_I("[FS] Total sectors: %lu, reserved: 32, clusters: 4KB\r\n", total_sectors);
+}
+
+
