@@ -1,4 +1,4 @@
-# STM32WB55 BLE → USB VCP Bridge
+# STM32WB55 BLE → USB CDC Bridge
 
 A demonstration project that bridges **Bluetooth Low Energy (BLE)** data to a **USB Virtual COM Port (CDC ACM)** on the **WeAct STM32WB55CGUx** (1 MB Flash) development board.
 
